@@ -248,13 +248,50 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
 
 # ─────────────────────────────────────────────
 #  Transform: TillAudit
+#
+#  Column detection is header-name driven so that
+#  extra or shifted columns (e.g. Gift Cards,
+#  Vouchers) never corrupt the positional mapping.
+#
+#  Any column whose header contains "gift" or
+#  "voucher" (case-insensitive) is treated as an
+#  additional deposit and summed into Deposits.
 # ─────────────────────────────────────────────
+
+# Canonical header → internal name mapping.
+# Keys are lowercase substrings to match flexibly.
+_TILL_COL_MAP = {
+    "date":     "Date",
+    "client":   "Client",
+    "cash":     "Cash",
+    "cards":    "Cards",
+    "other":    "Other",
+    "total":    "Total",
+    "service":  "Services",   # matches "Services", "Service Total" etc.
+    "retail":   "Retail",
+}
+# These substrings mark columns that should be added to Deposits
+_DEPOSIT_EXTRA_KEYWORDS = ["gift", "voucher", "deposit"]
+
+
+def _match_col(header: str) -> str | None:
+    """Return internal column name for a header string, or None if unrecognised."""
+    if not header or not isinstance(header, str):
+        return None
+    h = header.strip().lower()
+    for key, name in _TILL_COL_MAP.items():
+        if key in h:
+            return name
+    return None
+
+
 def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
     sheets = _read_xls_bytes(file_bytes)
     if not sheets:
         raise ValueError("No sheets found in TillAudit file.")
     grid = next(iter(sheets.values()))
 
+    # ── Find header row ──────────────────────────────────────────
     header_row = None
     for i, row in enumerate(grid):
         cleaned = [_clean_cell(v) for v in row]
@@ -263,38 +300,100 @@ def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
             header_row = i
             break
 
-    KEEP = [1, 4, 10, 12, 15, 18, 21, 24]
-    COL_NAMES = ["Date", "Client", "Cash", "Cards", "Other", "Total", "Services", "Retail"]
-
     if header_row is None:
-        data_rows = []
-        for row in grid:
-            if max(KEEP) >= len(row): continue
-            vals = [_clean_cell(row[c]) for c in KEEP]
-            if all(v is None for v in vals): continue
-            data_rows.append(vals)
-        df_raw = pd.DataFrame(data_rows, columns=COL_NAMES)
-    else:
-        rows = []
-        for row in grid[header_row+1:]:
-            cleaned = [_clean_cell(row[i]) if i < len(row) else None for i in range(len(row))]
-            if all(v is None for v in cleaned): continue
-            vals = [cleaned[c] if c < len(cleaned) else None for c in KEEP]
-            rows.append(vals)
-        df_raw = pd.DataFrame(rows, columns=COL_NAMES)
+        raise ValueError(
+            "Could not find a header row containing 'Date' and 'Client' "
+            "in TillAudit file. Check the file format."
+        )
 
+    # ── Build header→index map ───────────────────────────────────
+    raw_headers = [_clean_cell(v) for v in grid[header_row]]
+
+    # col_index["Date"] = 3, col_index["Cash"] = 10, etc.
+    col_index: dict[str, int] = {}
+    # deposit_extra_indices: indices of gift card / voucher columns
+    deposit_extra_indices: list[int] = []
+
+    for idx, h in enumerate(raw_headers):
+        if not h or not isinstance(h, str):
+            continue
+        h_low = h.strip().lower()
+        internal = _match_col(h)
+        if internal and internal not in col_index:
+            col_index[internal] = idx
+        # Check for extra deposit-like columns (gift cards, vouchers)
+        # Exclude the main "Deposits" column itself (already mapped above)
+        if any(kw in h_low for kw in _DEPOSIT_EXTRA_KEYWORDS) and internal != "Other":
+            if idx not in col_index.values():   # not already mapped to a core column
+                deposit_extra_indices.append(idx)
+
+    required = ["Date", "Client"]
+    missing = [c for c in required if c not in col_index]
+    if missing:
+        raise ValueError(f"TillAudit file is missing required columns: {missing}")
+
+    # ── Parse data rows ──────────────────────────────────────────
+    data_rows = []
+    for row in grid[header_row + 1:]:
+        cleaned = [_clean_cell(row[i]) if i < len(row) else None for i in range(len(row))]
+        if all(v is None for v in cleaned):
+            continue
+
+        def _get(name):
+            idx = col_index.get(name)
+            return cleaned[idx] if idx is not None and idx < len(cleaned) else None
+
+        # Sum any gift card / voucher columns for this row
+        extra_deposit = 0.0
+        for idx in deposit_extra_indices:
+            v = cleaned[idx] if idx < len(cleaned) else None
+            try:
+                extra_deposit += float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                pass
+
+        data_rows.append({
+            "Date":     _get("Date"),
+            "Client":   _get("Client"),
+            "Cash":     _get("Cash"),
+            "Cards":    _get("Cards"),
+            "Other":    _get("Other"),
+            "Total":    _get("Total"),
+            "Services": _get("Services"),
+            "Retail":   _get("Retail"),
+            "_extra_deposit": extra_deposit,
+        })
+
+    df_raw = pd.DataFrame(data_rows)
+
+    # ── Stylist fill-down ────────────────────────────────────────
+    # Rows where Client is null but Date is a string = stylist name row
     df_raw["Stylist"] = df_raw.apply(
-        lambda r: r["Date"] if (r["Client"] is None and r["Date"] is not None and isinstance(r["Date"], str)) else None,
-        axis=1
+        lambda r: r["Date"]
+        if (r["Client"] is None and r["Date"] is not None and isinstance(r["Date"], str))
+        else None,
+        axis=1,
     )
     df_raw["Stylist"] = df_raw["Stylist"].ffill()
 
+    # Keep only client rows
     df = df_raw[df_raw["Client"].notna()].copy()
-    df = df[["Stylist", "Date", "Client", "Cash", "Cards", "Other", "Total", "Services", "Retail"]]
+
+    # ── Type conversions ─────────────────────────────────────────
     df["Date"] = df["Date"].apply(lambda v: _excel_date(v) if isinstance(v, float) else v)
     for c in ["Cash", "Cards", "Other", "Total", "Services", "Retail"]:
         df[c] = df[c].apply(_to_currency)
-    return df.reset_index(drop=True)
+    df["_extra_deposit"] = pd.to_numeric(df["_extra_deposit"], errors="coerce").fillna(0.0)
+
+    # Report which extra columns were found (shown in UI)
+    extra_col_names = []
+    for idx in deposit_extra_indices:
+        if idx < len(raw_headers) and raw_headers[idx]:
+            extra_col_names.append(raw_headers[idx])
+    df.attrs["extra_deposit_cols"] = extra_col_names
+
+    return df[["Stylist", "Date", "Client", "Cash", "Cards", "Other",
+               "Total", "Services", "Retail", "_extra_deposit"]].reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────
@@ -324,6 +423,11 @@ def build_output(df_main: pd.DataFrame, df_report: pd.DataFrame,
 
     for c in ["Cash_1", "Cash1_1", "Deposits_1", "Retail"]:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
+
+    # Fold any extra deposit columns (gift cards, vouchers) into Deposits_1
+    if "_extra_deposit" in merged.columns:
+        merged["_extra_deposit"] = pd.to_numeric(merged["_extra_deposit"], errors="coerce").fillna(0.0)
+        merged["Deposits_1"] = merged["Deposits_1"] + merged["_extra_deposit"]
 
     merged["Cash1_Final"]  = ((merged["Cash1_1"] + merged["Cash_1"]) - merged["Retail"]).round(2)
     merged["Svc_to_Salon"] = (merged["Cash1_Final"] * cash_rate).round(2)
@@ -513,6 +617,15 @@ with st.spinner("Reading and processing files…"):
         st.error(f"❌  Error processing files: {e}")
         import traceback; st.code(traceback.format_exc())
         st.stop()
+
+# Notify user if extra deposit columns were detected
+_extra_cols = df_main.attrs.get("extra_deposit_cols", [])
+if _extra_cols:
+    st.info(
+        f"ℹ️  Extra deposit column(s) detected and added to Deposits: "
+        f"**{', '.join(_extra_cols)}**",
+        icon="💳",
+    )
 
 all_stylists = sorted(df_main["Stylist"].dropna().unique())
 
