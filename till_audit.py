@@ -1,6 +1,7 @@
 import io
 import struct
 import datetime
+import zipfile
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -341,6 +342,145 @@ def build_output(df_main: pd.DataFrame, df_report: pd.DataFrame,
     return out.sort_values(["Stylist", "Date"]).reset_index(drop=True)
 
 
+
+# ─────────────────────────────────────────────
+#  PDF statement generator (reportlab)
+# ─────────────────────────────────────────────
+def _build_stylist_statement_pdf(stylist: str, rows: pd.DataFrame,
+                                  date_from, date_to) -> bytes:
+    """
+    Returns a PDF as bytes for a single stylist client statement.
+    rows: filtered df_out rows for this stylist.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, HRFlowable)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=20*mm, rightMargin=20*mm,
+        topMargin=20*mm, bottomMargin=20*mm,
+    )
+
+    styles = getSampleStyleSheet()
+    heading = ParagraphStyle("heading", fontSize=16, fontName="Helvetica-Bold",
+                              alignment=TA_CENTER, spaceAfter=4)
+    subhead  = ParagraphStyle("subhead", fontSize=11, fontName="Helvetica",
+                               alignment=TA_CENTER, spaceAfter=2, textColor=colors.HexColor("#4b5563"))
+    stylist_style = ParagraphStyle("stylist", fontSize=13, fontName="Helvetica-Bold",
+                                    alignment=TA_CENTER, spaceAfter=8,
+                                    textColor=colors.HexColor("#1e3a5f"))
+
+    story = []
+
+    # Header
+    story.append(Paragraph("Touche Hairdressing Purley", heading))
+    story.append(Paragraph("Client Statement", subhead))
+
+    # Date range
+    def _fmt(d):
+        if d is None: return "—"
+        try: return d.strftime("%d %b %Y")
+        except: return str(d)
+    story.append(Paragraph(f"{_fmt(date_from)}  –  {_fmt(date_to)}", subhead))
+    story.append(Spacer(1, 4*mm))
+    story.append(HRFlowable(width="100%", thickness=1.5,
+                              color=colors.HexColor("#1e3a5f")))
+    story.append(Spacer(1, 3*mm))
+    story.append(Paragraph(stylist, stylist_style))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                              color=colors.HexColor("#d1d5db")))
+    story.append(Spacer(1, 5*mm))
+
+    # Table
+    col_headers = ["Date", "Client", "Cash (Net Retail)", "Deposits"]
+    table_data  = [col_headers]
+
+    total_cash = 0.0
+    total_dep  = 0.0
+
+    for _, row in rows.iterrows():
+        d = row.get("Date")
+        try:   d_str = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+        except: d_str = str(d)
+
+        cash = row.get("Cash (Net of Retail)", 0.0) or 0.0
+        dep  = row.get("Deposits", 0.0) or 0.0
+        total_cash += cash
+        total_dep  += dep
+
+        table_data.append([
+            d_str,
+            str(row.get("Client", "")),
+            f"£{cash:,.2f}",
+            f"£{dep:,.2f}",
+        ])
+
+    # Totals row
+    table_data.append(["", "TOTAL", f"£{total_cash:,.2f}", f"£{total_dep:,.2f}"])
+
+    col_widths = [28*mm, 75*mm, 38*mm, 32*mm]
+    tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+
+    n_data = len(table_data)
+    tbl.setStyle(TableStyle([
+        # Header row
+        ("BACKGROUND",  (0,0), (-1,0),  colors.HexColor("#1e3a5f")),
+        ("TEXTCOLOR",   (0,0), (-1,0),  colors.white),
+        ("FONTNAME",    (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",    (0,0), (-1,0),  9),
+        ("ALIGN",       (0,0), (-1,0),  "CENTER"),
+        ("BOTTOMPADDING",(0,0),(-1,0),  6),
+        ("TOPPADDING",  (0,0), (-1,0),  6),
+        # Data rows — alternating
+        ("FONTNAME",    (0,1), (-1,-2), "Helvetica"),
+        ("FONTSIZE",    (0,1), (-1,-2), 8.5),
+        ("ROWBACKGROUNDS", (0,1), (-1,-2),
+         [colors.white, colors.HexColor("#f3f4f6")]),
+        ("ALIGN",       (2,1), (-1,-2), "RIGHT"),
+        ("TOPPADDING",  (0,1), (-1,-2), 4),
+        ("BOTTOMPADDING",(0,1),(-1,-2), 4),
+        # Totals row
+        ("BACKGROUND",  (0,-1), (-1,-1), colors.HexColor("#e8edf5")),
+        ("FONTNAME",    (0,-1), (-1,-1), "Helvetica-Bold"),
+        ("FONTSIZE",    (0,-1), (-1,-1), 9),
+        ("ALIGN",       (2,-1), (-1,-1), "RIGHT"),
+        ("TOPPADDING",  (0,-1), (-1,-1), 5),
+        ("BOTTOMPADDING",(0,-1),(-1,-1), 5),
+        ("LINEABOVE",   (0,-1), (-1,-1), 1, colors.HexColor("#1e3a5f")),
+        # Grid
+        ("GRID",        (0,0),  (-1,-1), 0.4, colors.HexColor("#d1d5db")),
+        ("LINEBELOW",   (0,0),  (-1,0),  1.5, colors.HexColor("#1e3a5f")),
+    ]))
+
+    story.append(tbl)
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_statements_zip(df_out: pd.DataFrame) -> bytes:
+    """Build a zip of one PDF per stylist."""
+    dates = pd.to_datetime(df_out["Date"], errors="coerce").dropna()
+    date_from = dates.min().date() if len(dates) else None
+    date_to   = dates.max().date() if len(dates) else None
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for stylist in sorted(df_out["Stylist"].dropna().unique()):
+            rows = df_out[df_out["Stylist"] == stylist].copy()
+            pdf_bytes = _build_stylist_statement_pdf(stylist, rows, date_from, date_to)
+            safe_name = stylist.replace("/", "-").replace("\\", "-")
+            zf.writestr(f"{safe_name} Statement.pdf", pdf_bytes)
+    zip_buf.seek(0)
+    return zip_buf.read()
+
+
 # ─────────────────────────────────────────────
 #  Sidebar — file upload only
 # ─────────────────────────────────────────────
@@ -565,7 +705,7 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════
 st.markdown("### ⬇️ Downloads")
 
-dl1, dl2, dl3 = st.columns(3)
+dl1, dl2, dl3, dl4 = st.columns(4)
 
 # Full output workbook
 out1 = io.BytesIO()
@@ -606,5 +746,15 @@ with dl3:
         "📥 Stylist Summary", data=out3,
         file_name="Till Audit Stylist Summary.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+# Stylist statements zip
+zip_bytes = _build_statements_zip(df_out)
+with dl4:
+    st.download_button(
+        "📄 Client Statements (ZIP)", data=zip_bytes,
+        file_name="Touche Stylist Statements.zip",
+        mime="application/zip",
         use_container_width=True,
     )
