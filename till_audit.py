@@ -327,7 +327,7 @@ def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
         # Use header, then select matching columns
         rows = []
         for row in grid[header_row+1:]:
-            cleaned = [_clean_cell(v) if i < len(row) else None for i, _ in enumerate(row)]
+            cleaned = [_clean_cell(row[i]) if i < len(row) else None for i in range(len(row))]
             if all(v is None for v in cleaned):
                 continue
             vals = [cleaned[c] if c < len(cleaned) else None for c in KEEP]
