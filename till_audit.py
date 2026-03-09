@@ -260,21 +260,28 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
 
 # Canonical header → internal name mapping.
 # Keys are lowercase substrings to match flexibly.
+# ORDER MATTERS: more specific entries must come before broad ones
+# ("gift cards" must not match "cards" -> Cards before we check "gift")
 _TILL_COL_MAP = {
-    "date":     "Date",
-    "client":   "Client",
-    "cash":     "Cash",
-    "cards":    "Cards",
-    "other":    "Other",
-    "total":    "Total",
-    "service":  "Services",   # matches "Services", "Service Total" etc.
-    "retail":   "Retail",
+    "date":      "Date",
+    "client":    "Client",
+    "cash1":     "Cash1",    # must precede "cash" so Cash1 isn't mapped to Cash
+    "cash":      "Cash",
+    "deposits":  "Deposits", # exact plural — must precede any "deposit" keyword check
+    "other":     "Other",
+    "total":     "Total",
+    "service":   "Services",
+    "retail":    "Retail",
+    # "cards" intentionally omitted — "Gift Cards" / "Other Card" / "Stripe" are
+    # handled separately as pass-through columns, not a core mapped field
 }
-# These substrings mark columns that should be added to Deposits
-_DEPOSIT_EXTRA_KEYWORDS = ["gift", "voucher", "deposit"]
+
+# Column headers that should be treated as additional Deposits.
+# Checked AFTER _match_col so already-mapped columns are never double-counted.
+_DEPOSIT_EXTRA_KEYWORDS = ["gift", "voucher"]   # removed "deposit" — Deposits is mapped above
 
 
-def _match_col(header: str) -> str | None:
+def _match_col(header: str):
     """Return internal column name for a header string, or None if unrecognised."""
     if not header or not isinstance(header, str):
         return None
@@ -321,11 +328,11 @@ def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
         internal = _match_col(h)
         if internal and internal not in col_index:
             col_index[internal] = idx
-        # Check for extra deposit-like columns (gift cards, vouchers)
-        # Exclude the main "Deposits" column itself (already mapped above)
-        if any(kw in h_low for kw in _DEPOSIT_EXTRA_KEYWORDS) and internal != "Other":
-            if idx not in col_index.values():   # not already mapped to a core column
-                deposit_extra_indices.append(idx)
+        # Check for extra deposit-like columns (gift cards, vouchers).
+        # Only treat as extra deposit if the column was NOT already mapped
+        # to a core internal column — prevents Deposits itself being double-counted.
+        if internal is None and any(kw in h_low for kw in _DEPOSIT_EXTRA_KEYWORDS):
+            deposit_extra_indices.append(idx)
 
     required = ["Date", "Client"]
     missing = [c for c in required if c not in col_index]
