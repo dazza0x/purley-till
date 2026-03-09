@@ -31,17 +31,9 @@ st.markdown("""
 
 # ─────────────────────────────────────────────
 #  Pure-Python XLS reader (no xlrd needed)
-#  Handles BIFF5/BIFF8 with LABEL, LABELSST,
-#  NUMBER, MULRK records.
 # ─────────────────────────────────────────────
 def _read_xls_bytes(file_bytes: bytes) -> dict:
-    """
-    Read a legacy .xls (OLE2/BIFF) file from raw bytes.
-    Returns {sheet_name: [[row], [row], ...]}
-    Strings that start with \\x01 are BIFF5-style UTF-16LE encoded.
-    """
     raw = file_bytes
-
     sector_size = 2 ** struct.unpack_from("<H", raw, 30)[0]
     num_fat = struct.unpack_from("<I", raw, 44)[0]
     difat = list(struct.unpack_from("<109I", raw, 76))
@@ -88,14 +80,12 @@ def _read_xls_bytes(file_bytes: bytes) -> dict:
         rl = struct.unpack_from("<H", wb, pos+2)[0]
         rd = wb[pos+4:pos+4+rl]
 
-        # SST (Shared String Table)
         if rt == 0x00FC:
             if len(rd) >= 8:
                 num_str = struct.unpack_from("<I", rd, 4)[0]
                 p = 8
                 for _ in range(num_str):
-                    if p + 3 > len(rd):
-                        break
+                    if p + 3 > len(rd): break
                     cc = struct.unpack_from("<H", rd, p)[0]
                     flags = rd[p+2]; p += 3
                     rich = bool(flags & 0x08); ext = bool(flags & 0x04)
@@ -110,32 +100,26 @@ def _read_xls_bytes(file_bytes: bytes) -> dict:
                     p += nr*4 + ne
                     SST.append(s2)
 
-        # BOUNDSHEET
         elif rt == 0x0085 and len(rd) >= 6:
             offset = struct.unpack_from("<I", rd, 0)[0]
             nl2 = rd[4]; fl = rd[5]
             nm = rd[6:6+nl2*2].decode("utf-16-le","ignore") if fl&1 else rd[6:6+nl2].decode("latin-1","ignore")
             sheet_names.append(nm); sheet_offsets.append(offset); sheets[nm] = {}
 
-        # BOF
         elif rt == 0x0809:
             if pos in sheet_offsets:
                 current_sheet = sheet_names[sheet_offsets.index(pos)]
 
-        # LABELSST
         elif rt == 0x00FD and current_sheet is not None and len(rd) >= 10:
             r = struct.unpack_from("<H", rd, 0)[0]
             c = struct.unpack_from("<H", rd, 2)[0]
             idx = struct.unpack_from("<I", rd, 6)[0]
-            if idx < len(SST):
-                sheets[current_sheet][(r, c)] = SST[idx]
+            if idx < len(SST): sheets[current_sheet][(r, c)] = SST[idx]
 
-        # LABEL (BIFF5-style: flag byte + utf-16-le or latin-1)
         elif rt == 0x0204 and current_sheet is not None and len(rd) >= 8:
             r = struct.unpack_from("<H", rd, 0)[0]
             c = struct.unpack_from("<H", rd, 2)[0]
             slen = struct.unpack_from("<H", rd, 6)[0]
-            # BIFF5 label: byte 8 is flag (0x01 = unicode)
             if len(rd) >= 9:
                 flag = rd[8]
                 if flag == 0x01:
@@ -146,13 +130,11 @@ def _read_xls_bytes(file_bytes: bytes) -> dict:
                 s2 = rd[8:8+slen].decode("latin-1", errors="ignore")
             sheets[current_sheet][(r, c)] = s2
 
-        # NUMBER
         elif rt == 0x0203 and current_sheet is not None and len(rd) >= 14:
             r = struct.unpack_from("<H", rd, 0)[0]
             c = struct.unpack_from("<H", rd, 2)[0]
             sheets[current_sheet][(r, c)] = struct.unpack_from("<d", rd, 6)[0]
 
-        # RK
         elif rt == 0x027E and current_sheet is not None and len(rd) >= 10:
             r = struct.unpack_from("<H", rd, 0)[0]
             c = struct.unpack_from("<H", rd, 2)[0]
@@ -161,7 +143,6 @@ def _read_xls_bytes(file_bytes: bytes) -> dict:
             if rk & 1: val /= 100
             sheets[current_sheet][(r, c)] = val
 
-        # MULRK
         elif rt == 0x00BE and current_sheet is not None:
             r = struct.unpack_from("<H", rd, 0)[0]
             cf = struct.unpack_from("<H", rd, 2)[0]
@@ -173,7 +154,6 @@ def _read_xls_bytes(file_bytes: bytes) -> dict:
 
         pos += 4 + rl
 
-    # Convert to 2D grid
     result = {}
     for nm, cells in sheets.items():
         if not cells:
@@ -188,29 +168,20 @@ def _read_xls_bytes(file_bytes: bytes) -> dict:
 
 
 def _clean_cell(v):
-    """Strip BIFF5 flag byte prefix from strings; return None for garbage floats."""
-    if v is None:
-        return None
+    if v is None: return None
     if isinstance(v, str):
-        if v.startswith("\x01"):
-            # Remaining bytes are UTF-16LE — decode the raw string chars
-            # After the flag byte the string was already decoded, just strip prefix
-            return v[1:]
+        if v.startswith("\x01"): return v[1:]
         return v.strip() or None
     if isinstance(v, float):
-        # Garbage pointer values from MULRK misparse
-        if v < 1 or v > 3_000_000:
-            return None
+        if v < 1 or v > 3_000_000: return None
         return v
     return v
 
 
 def _excel_date(val):
-    """Convert Excel serial date to Python date."""
     try:
         f = float(val)
-        if f < 1:
-            return None
+        if f < 1: return None
         return (datetime.date(1899, 12, 30) + datetime.timedelta(days=int(f)))
     except Exception:
         return None
@@ -224,10 +195,7 @@ def _to_currency(v):
 
 
 # ─────────────────────────────────────────────
-#  Transform: Till Audit Report  (left table)
-#  Power Query keeps: Col2=Date, Col4=Client,
-#  Col7=Cash, Col9=Cash1, Col10=Deposits, Col12=Total
-#  (0-indexed: 1,3,6,8,9,11)
+#  Transform: Till Audit Report
 # ─────────────────────────────────────────────
 def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
     sheets = _read_xls_bytes(file_bytes)
@@ -235,7 +203,6 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
         raise ValueError("No sheets found in Till Audit Report file.")
     grid = next(iter(sheets.values()))
 
-    # Find header row: look for a row containing "Date" and "Client"
     header_row = None
     for i, row in enumerate(grid):
         cleaned = [_clean_cell(v) for v in row]
@@ -245,16 +212,12 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
             break
 
     if header_row is None:
-        # Fallback: use Power Query column indices directly
-        # PQ keeps Col2,Col4,Col7,Col9,Col10,Col12 (1-indexed) → 1,3,6,8,9,11 (0-indexed)
         keep_cols = [1, 3, 6, 8, 9, 11]
         data_rows = []
         for row in grid:
-            if len(row) < 12:
-                continue
+            if len(row) < 12: continue
             vals = [_clean_cell(row[c]) if c < len(row) else None for c in keep_cols]
-            if vals[0] is None and vals[1] is None:
-                continue
+            if vals[0] is None and vals[1] is None: continue
             data_rows.append(vals)
         df = pd.DataFrame(data_rows, columns=["Date", "Client", "Cash", "Cash1", "Deposits", "Total"])
     else:
@@ -262,22 +225,18 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
         rows = []
         for row in grid[header_row+1:]:
             cleaned = [_clean_cell(v) if i < len(row) else None for i, v in enumerate(row)]
-            if all(v is None for v in cleaned):
-                continue
+            if all(v is None for v in cleaned): continue
             rows.append(cleaned[:len(headers)])
         df = pd.DataFrame(rows, columns=headers)
-        # Map to expected columns
         col_map = {}
         for col in df.columns:
             if col and isinstance(col, str):
                 cl = col.lower()
-                if cl == "date":      col_map[col] = "Date"
-                elif cl == "client":  col_map[col] = "Client"
-                elif cl == "cash" and "Date" not in col_map.values(): col_map[col] = "Cash"
-                elif cl == "cash":    col_map[col] = "Cash"
+                if cl == "date":     col_map[col] = "Date"
+                elif cl == "client": col_map[col] = "Client"
+                elif cl == "cash":   col_map[col] = "Cash"
         df = df.rename(columns=col_map)
 
-    # Clean up
     df = df[df["Client"].notna()].copy()
     df["Date"] = df["Date"].apply(lambda v: _excel_date(v) if isinstance(v, float) else v)
     for c in ["Cash", "Cash1", "Deposits", "Total"]:
@@ -287,12 +246,7 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-#  Transform: TillAudit  (main table)
-#  Power Query keeps: Col2=Date, Col5=Client,
-#  Col11=Cash, Col13=Cards, Col16=Other,
-#  Col19=Total, Col22=Services, Col25=Retail
-#  (0-indexed: 1,4,10,12,15,18,21,24)
-#  Then adds Stylist via ffill on rows where Client is null
+#  Transform: TillAudit
 # ─────────────────────────────────────────────
 def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
     sheets = _read_xls_bytes(file_bytes)
@@ -300,7 +254,6 @@ def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
         raise ValueError("No sheets found in TillAudit file.")
     grid = next(iter(sheets.values()))
 
-    # Find header row
     header_row = None
     for i, row in enumerate(grid):
         cleaned = [_clean_cell(v) for v in row]
@@ -309,71 +262,54 @@ def process_till_audit(file_bytes: bytes) -> pd.DataFrame:
             header_row = i
             break
 
-    # PQ column indices (0-based): Date=1, Client=4, Cash=10, Cards=12, Other=15, Total=18, Services=21, Retail=24
     KEEP = [1, 4, 10, 12, 15, 18, 21, 24]
     COL_NAMES = ["Date", "Client", "Cash", "Cards", "Other", "Total", "Services", "Retail"]
 
     if header_row is None:
         data_rows = []
         for row in grid:
-            if max(KEEP) >= len(row):
-                continue
+            if max(KEEP) >= len(row): continue
             vals = [_clean_cell(row[c]) for c in KEEP]
-            if all(v is None for v in vals):
-                continue
+            if all(v is None for v in vals): continue
             data_rows.append(vals)
         df_raw = pd.DataFrame(data_rows, columns=COL_NAMES)
     else:
-        # Use header, then select matching columns
         rows = []
         for row in grid[header_row+1:]:
             cleaned = [_clean_cell(row[i]) if i < len(row) else None for i in range(len(row))]
-            if all(v is None for v in cleaned):
-                continue
+            if all(v is None for v in cleaned): continue
             vals = [cleaned[c] if c < len(cleaned) else None for c in KEEP]
             rows.append(vals)
         df_raw = pd.DataFrame(rows, columns=COL_NAMES)
 
-    # Add Stylist: rows where Client is None carry the stylist name in Date column
     df_raw["Stylist"] = df_raw.apply(
         lambda r: r["Date"] if (r["Client"] is None and r["Date"] is not None and isinstance(r["Date"], str)) else None,
         axis=1
     )
     df_raw["Stylist"] = df_raw["Stylist"].ffill()
 
-    # Keep only client rows (Client not null)
     df = df_raw[df_raw["Client"].notna()].copy()
-
-    # Reorder
     df = df[["Stylist", "Date", "Client", "Cash", "Cards", "Other", "Total", "Services", "Retail"]]
-
-    # Date conversion
     df["Date"] = df["Date"].apply(lambda v: _excel_date(v) if isinstance(v, float) else v)
-
     for c in ["Cash", "Cards", "Other", "Total", "Services", "Retail"]:
         df[c] = df[c].apply(_to_currency)
-
     return df.reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────
-#  Join + derived columns  (mirrors Power Query)
+#  Join + derived columns
 # ─────────────────────────────────────────────
-def build_output(df_main: pd.DataFrame, df_report: pd.DataFrame) -> pd.DataFrame:
+def build_output(df_main: pd.DataFrame, df_report: pd.DataFrame,
+                 cash_rate: float = 0.30, deposit_rate: float = 0.70) -> pd.DataFrame:
     """
-    Left join df_main to df_report on Client + Date.
-    Then compute:
-      Cash1_Final  = (Cash1_1 + Cash_1) - Retail
-      Cash1_Rate   = Cash1_Final * 0.30
-      Deposit_Rate = (Deposits_1 / 1.2) * 0.70
-      Total_SIQ    = Cash1_Final + Deposits_1
+    cash_rate    : fraction of Cash1_Final charged as salon service fee
+    deposit_rate : fraction of deposit ex-VAT returned as rebate
     """
-    # Normalise join keys
-    df_main = df_main.copy()
+    df_main   = df_main.copy()
     df_report = df_report.copy()
 
-    df_main["_jdate"]   = pd.to_datetime(df_main["Date"], errors="coerce").dt.date
-    df_report["_jdate"] = pd.to_datetime(df_report["Date"], errors="coerce").dt.date
+    df_main["_jdate"]     = pd.to_datetime(df_main["Date"],   errors="coerce").dt.date
+    df_report["_jdate"]   = pd.to_datetime(df_report["Date"], errors="coerce").dt.date
     df_main["_jclient"]   = df_main["Client"].astype(str).str.strip().str.lower()
     df_report["_jclient"] = df_report["Client"].astype(str).str.strip().str.lower()
 
@@ -388,26 +324,25 @@ def build_output(df_main: pd.DataFrame, df_report: pd.DataFrame) -> pd.DataFrame
     for c in ["Cash_1", "Cash1_1", "Deposits_1", "Retail"]:
         merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
 
-    merged["Cash1_Final"]  = (merged["Cash1_1"] + merged["Cash_1"]) - merged["Retail"]
-    merged["Cash1_Rate"]   = (merged["Cash1_Final"] * 0.30).round(2)
-    merged["Deposit_Rate"] = ((merged["Deposits_1"] / 1.2) * 0.70).round(2)
+    merged["Cash1_Final"]  = ((merged["Cash1_1"] + merged["Cash_1"]) - merged["Retail"]).round(2)
+    merged["Svc_to_Salon"] = (merged["Cash1_Final"] * cash_rate).round(2)
+    merged["Dep_Rebate"]   = ((merged["Deposits_1"] / 1.2) * deposit_rate).round(2)
     merged["Total_SIQ"]    = (merged["Cash1_Final"] + merged["Deposits_1"]).round(2)
-    merged["Cash1_Final"]  = merged["Cash1_Final"].round(2)
 
     out = merged[["Stylist", "Date", "Client", "Cash1_Final", "Deposits_1",
-                  "Cash1_Rate", "Deposit_Rate", "Total_SIQ"]].copy()
+                  "Svc_to_Salon", "Dep_Rebate", "Total_SIQ"]].copy()
     out = out.rename(columns={
         "Cash1_Final":  "Cash (Net of Retail)",
         "Deposits_1":   "Deposits",
-        "Cash1_Rate":   "Cash Rate (30%)",
-        "Deposit_Rate": "Deposit Rate (58.3%)",
+        "Svc_to_Salon": "Services to Salon",
+        "Dep_Rebate":   "Deposit Rebate",
         "Total_SIQ":    "Total SIQ",
     })
     return out.sort_values(["Stylist", "Date"]).reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────
-#  Sidebar
+#  Sidebar — file upload only
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🧾 Till Audit")
@@ -423,77 +358,183 @@ with st.sidebar:
 #  Main
 # ─────────────────────────────────────────────
 st.markdown("## 🧾 Till Audit — Clean & Join")
-st.markdown("Replicates the Power Query workflow: cleans both files, joins on Client + Date, and computes derived columns.")
 st.markdown("---")
 
 if till_audit_file is None or till_report_file is None:
     st.info("👈  Upload **TillAudit** and **Till Audit Report** in the sidebar to begin.", icon="📂")
     st.stop()
 
-# ── Process ──
+# ── Process files ──
 with st.spinner("Reading and processing files…"):
     try:
         df_main   = process_till_audit(till_audit_file.read())
         df_report = process_till_audit_report(till_report_file.read())
-        df_out    = build_output(df_main, df_report)
     except Exception as e:
         st.error(f"❌  Error processing files: {e}")
         import traceback; st.code(traceback.format_exc())
         st.stop()
 
-# ── Summary KPIs ──
-st.markdown("### 📊 Summary")
+all_stylists = sorted(df_main["Stylist"].dropna().unique())
 
-total_siq      = df_out["Total SIQ"].sum()
-total_cash_net = df_out["Cash (Net of Retail)"].sum()
-total_deposits = df_out["Deposits"].sum()
-total_cash_rt  = df_out["Cash Rate (30%)"].sum()
-total_dep_rt   = df_out["Deposit Rate (58.3%)"].sum()
-n_stylists     = df_out["Stylist"].nunique()
-n_clients      = len(df_out)
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 1 — Scenario Controls
+# ═══════════════════════════════════════════════════════════════
+st.markdown("### ⚙️ Scenario Controls")
 
-k1,k2,k3,k4 = st.columns(4)
-k1.metric("Transactions",       f"{n_clients:,}")
-k2.metric("Stylists",           f"{n_stylists:,}")
-k3.metric("Total SIQ",          f"£{total_siq:,.2f}")
-k4.metric("Total Deposits",     f"£{total_deposits:,.2f}")
+sc1, sc2 = st.columns(2)
+with sc1:
+    cash_rate_pct = st.number_input(
+        "Cash Rate — Services to Salon (%)",
+        min_value=0.0, max_value=100.0, value=30.0, step=0.5,
+        help="Percentage of Cash (Net of Retail) charged to salon. Default 30%.",
+        key="cash_rate_pct",
+    )
+with sc2:
+    deposit_rate_pct = st.number_input(
+        "Deposit Rebate Rate (%)",
+        min_value=0.0, max_value=100.0, value=70.0, step=0.5,
+        help="Percentage of deposit ex-VAT (÷1.2) paid as rebate. Default 70%.",
+        key="deposit_rate_pct",
+    )
 
-k5,k6,k7,_ = st.columns(4)
-k5.metric("Cash (Net Retail)",  f"£{total_cash_net:,.2f}")
-k6.metric("Cash Rate (30%)",    f"£{total_cash_rt:,.2f}")
-k7.metric("Deposit Rate (58.3%)", f"£{total_dep_rt:,.2f}")
+cash_rate    = cash_rate_pct    / 100.0
+deposit_rate = deposit_rate_pct / 100.0
 
 st.markdown("---")
 
-# ── Stylist summary ──
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 2 — Chair Rent
+# ═══════════════════════════════════════════════════════════════
+st.markdown("### 🪑 Chair Rent")
+
+rent_col1, _ = st.columns([1, 3])
+with rent_col1:
+    daily_rate = st.number_input(
+        "Daily Rate (£)", min_value=0.0, value=0.0, step=1.0,
+        key="daily_rate",
+    )
+
+# Per-stylist days — 4 per row
+st.markdown("**Days worked per stylist**")
+cols_per_row = 4
+rows_of_stylists = [all_stylists[i:i+cols_per_row] for i in range(0, len(all_stylists), cols_per_row)]
+
+rent_days: dict[str, float] = {}
+for row_group in rows_of_stylists:
+    cols = st.columns(cols_per_row)
+    for col, stylist in zip(cols, row_group):
+        safe_key = f"rent_days_{stylist.replace(' ', '_').replace('/', '_')}"
+        rent_days[stylist] = col.number_input(
+            stylist, min_value=0.0, value=0.0, step=0.5,
+            key=safe_key, label_visibility="visible",
+        )
+
+# Build chair rent lookup: stylist -> total rent
+rent_lookup = {s: round(daily_rate * d, 2) for s, d in rent_days.items()}
+
+st.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════
+#  Build output with current rates
+# ═══════════════════════════════════════════════════════════════
+try:
+    df_out = build_output(df_main, df_report, cash_rate=cash_rate, deposit_rate=deposit_rate)
+except Exception as e:
+    st.error(f"❌  Error building output: {e}")
+    import traceback; st.code(traceback.format_exc())
+    st.stop()
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 3 — Summary KPIs
+# ═══════════════════════════════════════════════════════════════
+st.markdown("### 📊 Summary")
+
+total_cash_net  = df_out["Cash (Net of Retail)"].sum()
+total_deposits  = df_out["Deposits"].sum()
+total_svc       = df_out["Services to Salon"].sum()
+total_dep_reb   = df_out["Deposit Rebate"].sum()
+total_chair     = sum(rent_lookup.values())
+n_stylists      = df_out["Stylist"].nunique()
+n_clients       = len(df_out)
+
+k1,k2,k3,k4 = st.columns(4)
+k1.metric("Transactions",        f"{n_clients:,}")
+k2.metric("Stylists",            f"{n_stylists:,}")
+k3.metric("Cash (Net Retail)",   f"£{total_cash_net:,.2f}")
+k4.metric("Total Deposits",      f"£{total_deposits:,.2f}")
+
+k5,k6,k7,k8 = st.columns(4)
+k5.metric(f"Services to Salon ({cash_rate_pct:.1f}%)",     f"£{total_svc:,.2f}")
+k6.metric(f"Deposit Rebate ({deposit_rate_pct:.1f}%)",     f"£{total_dep_reb:,.2f}")
+k7.metric("Total Chair Rent",    f"£{total_chair:,.2f}")
+total_salon = total_svc + total_chair - total_dep_reb
+k8.metric("Net Salon Income",    f"£{total_salon:,.2f}")
+
+st.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 4 — Stylist Summary
+#  Columns: Stylist | Transactions | Cash (Net Retail) | Deposits
+#           | Services to Salon | Deposit Rebate | Chair Rent | Total
+#  Total = ((Cash + Deposits) - (Services to Salon + Chair Rent)) - Deposit Rebate
+# ═══════════════════════════════════════════════════════════════
 st.markdown("### 👤 Stylist Summary")
 
 summ = df_out.groupby("Stylist", as_index=False).agg(
-    Transactions     = ("Client",              "count"),
-    Cash_Net_Retail  = ("Cash (Net of Retail)", "sum"),
-    Deposits         = ("Deposits",              "sum"),
-    Cash_Rate        = ("Cash Rate (30%)",       "sum"),
-    Deposit_Rate     = ("Deposit Rate (58.3%)",  "sum"),
-    Total_SIQ        = ("Total SIQ",             "sum"),
+    Transactions      = ("Client",               "count"),
+    Cash_Net_Retail   = ("Cash (Net of Retail)",  "sum"),
+    Deposits          = ("Deposits",               "sum"),
+    Services_to_Salon = ("Services to Salon",      "sum"),
+    Deposit_Rebate    = ("Deposit Rebate",          "sum"),
 ).round(2)
-summ.columns = ["Stylist","Transactions","Cash (Net Retail)","Deposits","Cash Rate (30%)","Deposit Rate (58.3%)","Total SIQ"]
 
-currency_cols = ["Cash (Net Retail)","Deposits","Cash Rate (30%)","Deposit Rate (58.3%)","Total SIQ"]
+summ["Chair Rent"] = summ["Stylist"].map(rent_lookup).fillna(0.0)
+
+summ["Total"] = (
+    (summ["Cash_Net_Retail"] + summ["Deposits"])
+    - (summ["Services_to_Salon"] + summ["Chair Rent"])
+    - summ["Deposit_Rebate"]
+).round(2)
+
+summ.columns = [
+    "Stylist", "Transactions",
+    "Cash (Net Retail)", "Deposits",
+    "Services to Salon", "Deposit Rebate",
+    "Chair Rent", "Total",
+]
+
+currency_cols = ["Cash (Net Retail)", "Deposits", "Services to Salon",
+                 "Deposit Rebate", "Chair Rent", "Total"]
+
+def _colour_total(val):
+    if isinstance(val, (int, float)):
+        color = "#166534" if val >= 0 else "#991b1b"
+        bg    = "#dcfce7"  if val >= 0 else "#fee2e2"
+        return f"color:{color}; background-color:{bg}; font-weight:600;"
+    return ""
+
+styled_summ = (
+    summ.style
+    .format({c: "£{:,.2f}" for c in currency_cols})
+    .applymap(_colour_total, subset=["Total"])
+)
+
 st.dataframe(
-    summ.style.format({c: "£{:,.2f}" for c in currency_cols}),
+    styled_summ,
     use_container_width=True,
     hide_index=True,
-    height=min(500, 60 + len(summ)*35),
+    height=min(600, 60 + len(summ)*38),
 )
+
 st.markdown("---")
 
-# ── Full detail table ──
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 5 — Full Detail
+# ═══════════════════════════════════════════════════════════════
 st.markdown("### 📋 Full Detail")
 
-# Filters
 fa, fb = st.columns(2)
 with fa:
-    all_stylists = sorted(df_out["Stylist"].dropna().unique())
     sel_stylists = st.multiselect("Filter by Stylist", all_stylists, default=all_stylists)
 with fb:
     date_vals = pd.to_datetime(df_out["Date"], errors="coerce").dropna()
@@ -510,7 +551,7 @@ if sel_dates and len(sel_dates) == 2:
 
 st.caption(f"Showing {len(filtered):,} of {len(df_out):,} rows.")
 
-currency_detail = ["Cash (Net of Retail)","Deposits","Cash Rate (30%)","Deposit Rate (58.3%)","Total SIQ"]
+currency_detail = ["Cash (Net of Retail)", "Deposits", "Services to Salon", "Deposit Rebate", "Total SIQ"]
 st.dataframe(
     filtered.style.format({c: "£{:,.2f}" for c in currency_detail if c in filtered.columns}),
     use_container_width=True,
@@ -519,12 +560,14 @@ st.dataframe(
 
 st.markdown("---")
 
-# ── Downloads ──
+# ═══════════════════════════════════════════════════════════════
+#  SECTION 6 — Downloads
+# ═══════════════════════════════════════════════════════════════
 st.markdown("### ⬇️ Downloads")
 
 dl1, dl2, dl3 = st.columns(3)
 
-# Full output
+# Full output workbook
 out1 = io.BytesIO()
 with pd.ExcelWriter(out1, engine="openpyxl") as writer:
     df_out.to_excel(writer, index=False, sheet_name="Till Audit Output")
@@ -534,8 +577,8 @@ with pd.ExcelWriter(out1, engine="openpyxl") as writer:
 out1.seek(0)
 with dl1:
     st.download_button(
-        "📥 Full Output Workbook",
-        data=out1, file_name="Till Audit Output.xlsx",
+        "📥 Full Output Workbook", data=out1,
+        file_name="Till Audit Output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -547,8 +590,8 @@ with pd.ExcelWriter(out2, engine="openpyxl") as writer:
 out2.seek(0)
 with dl2:
     st.download_button(
-        "📥 Filtered View",
-        data=out2, file_name="Till Audit Filtered.xlsx",
+        "📥 Filtered View", data=out2,
+        file_name="Till Audit Filtered.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -560,8 +603,8 @@ with pd.ExcelWriter(out3, engine="openpyxl") as writer:
 out3.seek(0)
 with dl3:
     st.download_button(
-        "📥 Stylist Summary",
-        data=out3, file_name="Till Audit Stylist Summary.xlsx",
+        "📥 Stylist Summary", data=out3,
+        file_name="Till Audit Stylist Summary.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
