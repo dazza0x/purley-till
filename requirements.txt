@@ -1,6 +1,6 @@
 pandas
 openpyxl
 plotly
+reportlab==4.2.5
 streamlit==1.41.1
 altair==4.2.2
-reportlab
