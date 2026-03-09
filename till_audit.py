@@ -199,11 +199,18 @@ def _to_currency(v):
 #  Transform: Till Audit Report
 # ─────────────────────────────────────────────
 def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Reads the Till Audit Detail report (Cash1 / Deposits file).
+    Uses the same header-driven column detection as process_till_audit so that
+    extra columns like 'Gift Cards' or 'Vouchers' are automatically detected
+    and summed into _extra_deposit for use in build_output.
+    """
     sheets = _read_xls_bytes(file_bytes)
     if not sheets:
         raise ValueError("No sheets found in Till Audit Report file.")
     grid = next(iter(sheets.values()))
 
+    # ── find header row ──────────────────────────────────────────
     header_row = None
     for i, row in enumerate(grid):
         cleaned = [_clean_cell(v) for v in row]
@@ -213,6 +220,7 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
             break
 
     if header_row is None:
+        # Fallback: fixed column positions
         keep_cols = [1, 3, 6, 8, 9, 11]
         data_rows = []
         for row in grid:
@@ -221,28 +229,68 @@ def process_till_audit_report(file_bytes: bytes) -> pd.DataFrame:
             if vals[0] is None and vals[1] is None: continue
             data_rows.append(vals)
         df = pd.DataFrame(data_rows, columns=["Date", "Client", "Cash", "Cash1", "Deposits", "Total"])
+        df["_extra_deposit"] = 0.0
+        df.attrs["extra_deposit_cols"] = []
     else:
-        headers = [_clean_cell(v) for v in grid[header_row]]
-        rows = []
-        for row in grid[header_row+1:]:
-            cleaned = [_clean_cell(v) if i < len(row) else None for i, v in enumerate(row)]
-            if all(v is None for v in cleaned): continue
-            rows.append(cleaned[:len(headers)])
-        df = pd.DataFrame(rows, columns=headers)
-        col_map = {}
-        for col in df.columns:
-            if col and isinstance(col, str):
-                cl = col.lower()
-                if cl == "date":     col_map[col] = "Date"
-                elif cl == "client": col_map[col] = "Client"
-                elif cl == "cash":   col_map[col] = "Cash"
-        df = df.rename(columns=col_map)
+        # ── header-driven column detection (mirrors process_till_audit) ──
+        raw_headers = [_clean_cell(v) for v in grid[header_row]]
+        col_index: dict[str, int] = {}
+        deposit_extra_indices: list[int] = []
 
+        for idx, h in enumerate(raw_headers):
+            if not h or not isinstance(h, str):
+                continue
+            h_low = h.strip().lower()
+            internal = _match_col(h)
+            if internal and internal not in col_index:
+                col_index[internal] = idx
+            # Collect gift card / voucher columns as extra deposits
+            if internal is None and any(kw in h_low for kw in _DEPOSIT_EXTRA_KEYWORDS):
+                deposit_extra_indices.append(idx)
+
+        extra_col_names = [
+            raw_headers[i] for i in deposit_extra_indices
+            if i < len(raw_headers) and raw_headers[i]
+        ]
+
+        # ── read data rows ───────────────────────────────────────
+        data_rows = []
+        for row in grid[header_row + 1:]:
+            cleaned = [_clean_cell(row[i]) if i < len(row) else None
+                       for i in range(len(raw_headers))]
+            if all(v is None for v in cleaned):
+                continue
+
+            def _get(name):
+                idx = col_index.get(name)
+                return cleaned[idx] if idx is not None and idx < len(cleaned) else None
+
+            extra_deposit = sum(
+                float(cleaned[idx] or 0)
+                for idx in deposit_extra_indices
+                if idx < len(cleaned) and cleaned[idx] is not None
+            )
+
+            data_rows.append({
+                "Date":           _get("Date"),
+                "Client":         _get("Client"),
+                "Cash":           _get("Cash"),
+                "Cash1":          _get("Cash1"),
+                "Deposits":       _get("Deposits"),
+                "Total":          _get("Total"),
+                "_extra_deposit": extra_deposit,
+            })
+
+        df = pd.DataFrame(data_rows)
+        df.attrs["extra_deposit_cols"] = extra_col_names
+
+    # ── tidy ─────────────────────────────────────────────────────
     df = df[df["Client"].notna()].copy()
     df["Date"] = df["Date"].apply(lambda v: _excel_date(v) if isinstance(v, float) else v)
     for c in ["Cash", "Cash1", "Deposits", "Total"]:
         if c in df.columns:
             df[c] = df[c].apply(_to_currency)
+    df["_extra_deposit"] = pd.to_numeric(df.get("_extra_deposit", 0), errors="coerce").fillna(0.0)
     return df.reset_index(drop=True)
 
 
@@ -420,21 +468,31 @@ def build_output(df_main: pd.DataFrame, df_report: pd.DataFrame,
     df_main["_jclient"]   = df_main["Client"].astype(str).str.strip().str.lower()
     df_report["_jclient"] = df_report["Client"].astype(str).str.strip().str.lower()
 
+    # Bring _extra_deposit from df_report (Gift Cards live in the Detail report file)
+    report_cols = ["_jclient", "_jdate", "Cash", "Cash1", "Deposits"]
+    if "_extra_deposit" in df_report.columns:
+        report_cols.append("_extra_deposit")
+
     merged = df_main.merge(
-        df_report[["_jclient", "_jdate", "Cash", "Cash1", "Deposits"]].rename(columns={
-            "Cash": "Cash_1", "Cash1": "Cash1_1", "Deposits": "Deposits_1"
+        df_report[report_cols].rename(columns={
+            "Cash": "Cash_1", "Cash1": "Cash1_1", "Deposits": "Deposits_1",
+            "_extra_deposit": "_extra_deposit_report",
         }),
         on=["_jclient", "_jdate"],
         how="left",
-    ).drop(columns=["_jclient", "_jdate", "Cash", "Cards", "Other", "Total", "Services"])
+    ).drop(columns=["_jclient", "_jdate", "Cash", "Cards", "Other", "Total", "Services"],
+           errors="ignore")
 
     for c in ["Cash_1", "Cash1_1", "Deposits_1", "Retail"]:
-        merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
+        merged[c] = pd.to_numeric(merged.get(c), errors="coerce").fillna(0.0)
 
-    # Fold any extra deposit columns (gift cards, vouchers) into Deposits_1
-    if "_extra_deposit" in merged.columns:
-        merged["_extra_deposit"] = pd.to_numeric(merged["_extra_deposit"], errors="coerce").fillna(0.0)
-        merged["Deposits_1"] = merged["Deposits_1"] + merged["_extra_deposit"]
+    # Fold Gift Cards / vouchers into Deposits_1.
+    # _extra_deposit_report = from Detail file (e.g. Gift Cards column)
+    # _extra_deposit         = from Self Employed file (fallback, usually 0)
+    for col in ["_extra_deposit_report", "_extra_deposit"]:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0.0)
+            merged["Deposits_1"] = merged["Deposits_1"] + merged[col]
 
     merged["Cash1_Final"]  = ((merged["Cash1_1"] + merged["Cash_1"]) - merged["Retail"]).round(2)
     merged["Svc_to_Salon"] = (merged["Cash1_Final"] * cash_rate).round(2)
@@ -609,7 +667,7 @@ with st.sidebar:
 #  Main
 # ─────────────────────────────────────────────
 st.markdown("## 🧾 Till Audit — Clean & Join")
-st.caption("v1.4 — Gift Cards fix · applymap fix")
+st.caption("v1.5 — Gift Cards from Detail report")
 st.markdown("---")
 
 if till_audit_file is None or till_report_file is None:
