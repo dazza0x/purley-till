@@ -609,6 +609,7 @@ with st.sidebar:
 #  Main
 # ─────────────────────────────────────────────
 st.markdown("## 🧾 Till Audit — Clean & Join")
+st.caption("v1.4 — Gift Cards fix · applymap fix")
 st.markdown("---")
 
 if till_audit_file is None or till_report_file is None:
@@ -776,7 +777,7 @@ def _colour_total(val):
 styled_summ = (
     summ.style
     .format({c: "£{:,.2f}" for c in currency_cols})
-    .applymap(_colour_total, subset=["Total"])
+    .map(_colour_total, subset=["Total"])
 )
 
 st.dataframe(
